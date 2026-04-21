@@ -6,6 +6,25 @@
 
 ### 核心功能
 
+<img width="545" height="775" alt="Pasted Graphic 2" src="https://github.com/user-attachments/assets/a787564c-f267-45a4-a429-ed5c2bae125f" />
+
+<img width="527" height="748" alt="Pasted Graphic 3" src="https://github.com/user-attachments/assets/5033fe56-10b3-4a99-9cc0-d7f34350baee" />
+
+<img width="518" height="773" alt="Pasted Graphic 4" src="https://github.com/user-attachments/assets/520c57a7-2a39-4e2f-a550-32657a11767b" />
+
+<img width="533" height="780" alt="Pasted Graphic 5" src="https://github.com/user-attachments/assets/586f87e2-1fc8-4126-99dd-dc6b20b4d80e" />
+
+
+<img width="528" height="689" alt="Pasted Graphic 6" src="https://github.com/user-attachments/assets/115d48dc-5fd6-4eb8-89d6-968577625647" />
+
+<img width="543" height="786" alt="Pasted Graphic 7" src="https://github.com/user-attachments/assets/1e15c4b7-d0b9-4752-9ada-1c378e794af0" />
+
+
+<img width="570" height="778" alt="Pasted Graphic 8" src="https://github.com/user-attachments/assets/20c301cd-7b13-45cd-89af-23b6832f960a" />
+
+<img width="557" height="797" alt="Pasted Graphic 9" src="https://github.com/user-attachments/assets/5f855db5-0c46-4c2b-bba2-2919d341ce58" />
+
+
 1. **文本转提示词 (Text-to-Prompt)**
    - 根据用户需求描述，自动生成适合不同平台的AI图像提示词
    - 支持风格分析、构图分析、情绪分析、视觉概念提取等
