@@ -452,3 +452,826 @@ query
 ## License
 
 MIT License
+
+
+
+## 目录
+
+1. [系统概述](#系统概述)
+2. [核心设计模式](#核心设计模式)
+3. [Agent通信机制](#agent通信机制)
+4. [数据流与状态管理](#数据流与状态管理)
+5. [ReAct执行循环](#react执行循环)
+6. [Context构建机制](#context构建机制)
+7. [Notes系统设计](#notes系统设计)
+8. [代码实现详解](#代码实现详解)
+9. [如何开发新的Agent](#如何开发新的agent)
+10. [如何开发新的Action](#如何开发新的action)
+
+---
+
+## 系统概述
+
+ImagePrompt是一个基于**多Agent协作**的AI图像提示词生成系统。其核心理念是模拟一个专业内容创作团队的工作方式：
+
+```
+用户输入
+    │
+    ▼
+┌─────────────────┐
+│   Concierge     │ ← 前台接待：理解需求、路由任务
+└────────┬────────┘
+         │ <call_orchestrator> 标签触发
+         ▼
+┌─────────────────┐
+│   Tactician     │ ← 策略分析：深度分析任务、制定执行计划
+└────────┬────────┘
+         │ strategy_notes
+         ▼
+┌─────────────────┐
+│   Orchestrator  │ ← 任务编排：ReAct循环、指挥Action执行
+└────────┬────────┘
+         │ <execute action="xxx"> 标签触发
+         ▼
+┌─────────────────┐
+│    Actions      │ ← 执行单元：各类专业分析/生成动作
+└────────┬────────┘
+         │ notes_created
+         ▼
+┌─────────────────┐
+│    WorkSpace    │ ← 数据中心：存储所有Notes和状态
+└─────────────────┘
+```
+
+---
+
+## 核心设计模式
+
+### 1. Prompt-Driven Architecture（提示词驱动架构）
+
+每个Agent的核心是其**System Prompt**，定义了Agent的角色、能力边界、输出格式。
+
+```python
+# concierge.py
+class Concierge:
+    def __init__(self, workspace, conversation):
+        self.system_prompt = concierge_prompt  # 预定义的提示词模板
+```
+
+**设计要点：**
+- System Prompt定义Agent的"人格"和"职责"
+- Prompt中嵌入输出格式规范（XML标签）
+- Agent通过LLM的function calling能力输出结构化指令
+
+### 2. 上下文注入模式
+
+每个Agent的`process_task()`方法都会调用`build_xxx_context()`构建专属上下文：
+
+```python
+# orchestrator.py
+def process_task(self, task_message: str, execution_log: list):
+    context = build_orchestrator_context(
+        task_message, self.workspace, self.conversation, execution_log
+    )
+    response = call_llm(
+        system_prompt=self.system_prompt,
+        user_prompt=context,
+        ...
+    )
+```
+
+**上下文包含：**
+- 当前任务消息
+- 历史执行记录（Round N: observe/think/执行了哪些Action）
+- 已创建的Notes（可被@引用）
+- Tactician分析结果
+
+### 3. XML指令标签模式
+
+Agent通过XML标签向系统传递指令：
+
+```xml
+<!-- Concierge → 系统 -->
+<call_orchestrator>
+用户希望生成赛博朋克城市雨夜图像...
+</call_orchestrator>
+
+<!-- Orchestrator → 系统 -->
+<execute action="midjourney_prompt" instruction="基于@visual_concept1生成MJ提示词"/>
+
+<!-- 系统 → LLM -->
+<think>这里是我的思考过程...</think>
+<observe>这是我观察到的结果...</observe>
+```
+
+**解析机制：**
+```python
+# orchestrator.py
+def _extract_execute_commands(self, response: str) -> List[Dict[str, str]]:
+    """从LLM响应中提取execute命令"""
+    patterns = [
+        r'<execute\s+action="([^"]+)"\s+instruction="([^"]+)"\s*/?>',
+        # ... 多种格式兼容
+    ]
+    # 正则匹配，提取action和instruction
+```
+
+---
+
+## Agent通信机制
+
+### Agent间的通信流程
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                         Concierge                                 │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ 1. 接收用户输入                                              │ │
+│  │ 2. 调用LLM，理解意图                                        │ │
+│  │ 3. 如果需要生成提示词，输出 <call_orchestrator>              │ │
+│  │ 4. 解析响应，检测是否包含 <call_orchestrator>                │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+                                │
+                                │ conversation.add_concierge_response()
+                                ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                      ConversationManager                           │
+│  - history: 完整对话历史                                          │
+│  - _orchestrator_calls: Orchestrator调用记录                      │
+│  - _active_orchestrator_index: 当前活跃调用索引                    │
+└──────────────────────────────────────────────────────────────────┘
+                                │
+                                │ CLI层检查 orchestrator_call
+                                ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                      ImagePromptCLI                               │
+│  run_orchestrator_async(task_message)                            │
+└──────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                         Tactician                                 │
+│  - analyze_task() → strategy_notes → workspace.tactician_analysis │
+└──────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                        Orchestrator                               │
+│  process_task() → ReAct循环 → <execute action="xxx">            │
+└──────────────────────────────────────────────────────────────────┘
+                                │
+                                │ execute()
+                                ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                     execute() 函数                                 │
+│  - 根据action_type从ACTION_PROMPTS获取prompt                      │
+│  - 调用call_llm()                                                │
+│  - 提取notes → workspace.create_note()                           │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### XML标签的流转
+
+1. **Concierge输出标签**：
+```python
+# concierge.py 第81-104行
+def _extract_orchestrator_call(self, response: str) -> Optional[str]:
+    # 匹配 <call_orchestrator>...</call_orchestrator>
+    match = re.search(r'<call_orchestrator>(.*?)</call_orchestrator>', response, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+```
+
+2. **CLI捕获标签**：
+```python
+# ImagePrompt.py 第381-412行
+def handle_user_input(self, user_input: str):
+    response = self.concierge.process_user_input(user_input)
+    if after_count > before_count:  # 检测到orchestrator_call
+        self.run_orchestrator_async(task_message)
+```
+
+3. **Orchestrator输出标签**：
+```python
+# orchestrator.py 第232-279行
+def _extract_execute_commands(self, response: str) -> List[Dict[str, str]]:
+    # 匹配 <execute action="xxx" instruction="yyy"/>
+    commands = []
+    for match in re.finditer(pattern, response, re.DOTALL):
+        commands.append({
+            "action": match.group(1),
+            "instruction": match.group(2)
+        })
+    return commands
+```
+
+---
+
+## 数据流与状态管理
+
+### 三大核心对象
+
+#### 1. WorkSpace（数据中心）
+
+```python
+class WorkSpace:
+    def __init__(self):
+        self.notes: Dict[str, Dict[str, str]] = {}      # 所有Notes
+        self._note_counters: Dict[str, int] = {}         # 编号计数器
+        self.tactics: Optional[str] = None                # Orchestrator工作备忘
+        self.tactician_analysis: Dict[str, Any] = {}     # Tactician分析结果
+```
+
+**Note数据结构：**
+```python
+{
+    "type": "midjourney_prompt",    # Note类型
+    "content": "cyberpunk city...", # 内容
+    "source": "step_1",            # 来源
+    "review_status": "star",        # 评审状态
+    "review_comment": "高质量"       # 评审意见
+}
+```
+
+#### 2. ConversationManager（会话历史）
+
+```python
+class ConversationManager:
+    def __init__(self):
+        self.history: List[Dict] = []                    # 完整历史
+        self._orchestrator_calls: List[Dict] = []        # Orchestrator调用
+        self._active_orchestrator_index: Optional[int] = None
+        self._orchestrator_running: bool = False
+```
+
+**history条目类型：**
+- `user`: 用户消息
+- `concierge`: Concierge响应
+- `orchestrator`: Orchestrator响应
+- `execution`: 执行记录
+
+#### 3. execution_log（执行日志）
+
+由Orchestrator维护，传给`process_task()`：
+
+```python
+execution_log = []  # 初始化
+for iteration in range(max_iterations):
+    result = self.orchestrator.process_task(task_message, execution_log)
+    execution_log.append({
+        "iteration": iteration + 1,
+        "command_index": cmd_idx,
+        "action": cmd['action'],
+        "instruction": cmd['instruction'],
+        "result": step_result
+    })
+```
+
+---
+
+## ReAct执行循环
+
+ReAct（Reasoning + Acting）是Orchestrator的核心执行模式：
+
+### 执行流程
+
+```python
+# orchestrator.py 第41-72行
+def process_task(self, task_message: str, execution_log: list):
+    for iteration in range(max_iterations):  # 最多3轮
+        # 1. 调用LLM进行推理
+        response = call_llm(
+            system_prompt=self.system_prompt,
+            user_prompt=context,
+            ...
+        )
+
+        # 2. 提取思考结果（可选）
+        think_content = self._extract_think_content(response)
+
+        # 3. 提取执行命令
+        commands = self._extract_execute_commands(response)
+
+        # 4. 提取观察结果（可选）
+        observe_content = self._extract_observe_content(response)
+
+        # 5. 记录执行日志
+        execution_log.append({
+            "iteration": iteration,
+            "think": think_content,
+            "observe": observe_content,
+            "commands": commands
+        })
+
+        # 6. 解析complete状态
+        if self._is_completed(response):
+            return {"completed": True, "execute_commands": []}
+
+        # 7. 执行所有命令
+        for cmd in commands:
+            execute(cmd['action'], cmd['instruction'], ...)
+```
+
+### Orchestrator的System Prompt
+
+```python
+# orchestrator_prompt.py
+"""
+## Action执行
+
+<execute action="action_type" instruction="具体指令"/>
+- action: subject_analysis / style_analysis / midjourney_prompt 等
+- instruction: 给Action的具体任务描述
+
+## 工作流程
+Round1: subject + style + mood + composition（并行）
+Round2: visual_concept（整合）
+Round3: midjourney_prompt / dalle_prompt / sd_prompt（生成）
+"""
+```
+
+### 三轮执行示例
+
+```
+Round 1:
+  Orchestrator → LLM: "为'赛博朋克城市雨夜'生成提示词"
+  LLM响应:
+    <think>需要分析主体、风格、氛围...</think>
+    <execute action="subject_analysis" instruction="分析赛博朋克城市雨夜"/>
+    <execute action="style_analysis" instruction="分析赛博朋克风格"/>
+  执行: subject_analysis + style_analysis → workspace.notes
+
+Round 2:
+  Orchestrator → LLM: "基于之前的分析，整合视觉概念"
+  LLM响应:
+    <execute action="visual_concept" instruction="整合@subject_analysis1和@style_analysis1"/>
+  执行: visual_concept → workspace.notes
+
+Round 3:
+  Orchestrator → LLM: "基于视觉概念生成最终提示词"
+  LLM响应:
+    <execute action="midjourney_prompt" instruction="基于@visual_concept1生成MJ提示词"/>
+    <complete/>
+  执行: midjourney_prompt → workspace.notes
+  完成!
+```
+
+---
+
+## Context构建机制
+
+### build_orchestrator_context()
+
+为Orchestrator构建上下文，包含：
+
+```python
+# context_builder.py 第158-365行
+def build_orchestrator_context(task_message, workspace, conversation, execution_log):
+    parts = []
+
+    # 1. 任务执行时间线
+    parts.append("[任务执行时间线]")
+    for msg_idx, msg in enumerate(all_messages):
+        parts.append(f"用户消息{msg_idx + 1}: {msg['message']}")
+
+        # 显示material材料
+        for note_id in workspace.notes:
+            if note_id.startswith('material'):
+                parts.append(f"@{note_id}: {note_data['content']}")
+
+        # 显示该消息的执行记录
+        for record in msg['execution_records']:
+            parts.append(f"## Round{round_num}:")
+            parts.append(f"🔍 观察: {record['observe']}")
+            parts.append(f"💭 思考: {record['think']}")
+            parts.append(f"⚡ 执行: {actions}")
+
+            # 显示该Round产出的Notes
+            for note_id in record['notes_created']:
+                parts.append(f"📝 @{note_id}: {note_preview}")
+
+    # 2. Tactician分析结果
+    if workspace.tactician_analysis:
+        parts.append("[Tactician分析结果]")
+        for strategy_id in strategy_notes:
+            parts.append(f"@{strategy_id}: {content}")
+
+    return "\n".join(parts)
+```
+
+### build_action_context()
+
+为具体Action构建上下文：
+
+```python
+# context_builder.py 第368-441行
+def build_action_context(step, workspace, conversation):
+    parts = []
+
+    # 1. 用户需求（部分Action需要）
+    if step["action"] not in no_user_need_actions:
+        parts.append("[用户需求]")
+        parts.append(orchestrator_calls[0]['message'])
+
+    # 2. 任务指令
+    parts.append("[任务指令]")
+    parts.append(step["instruction"])
+
+    # 3. 展开@引用
+    # 例如 @visual_concept1 → 实际内容
+    refs = re.findall(r'@([a-zA-Z_]+\d+)', step["instruction"])
+    for ref in refs:
+        note_data = workspace.get_note(ref)
+        if note_data:
+            parts.append(f"@{ref}:")
+            parts.append(note_data["content"])
+
+    return "\n".join(parts)
+```
+
+### @引用替换机制
+
+```python
+# 在instruction中使用@引用
+instruction = "基于@visual_concept1生成MJ提示词"
+
+# 系统自动展开
+# @visual_concept1 → [引用内容]
+# Cyberpunk neon city at night, rain-slicked streets, ...
+```
+
+---
+
+## Notes系统设计
+
+### Note类型
+
+| 类型 | 来源 | 说明 |
+|------|------|------|
+| `material` | Concierge | 用户上传的参考材料 |
+| `subject_analysis` | Action | 主体分析结果 |
+| `style_analysis` | Action | 风格分析结果 |
+| `mood_analysis` | Action | 情绪分析结果 |
+| `visual_concept` | Action | 视觉概念 |
+| `midjourney_prompt` | Action | MJ提示词 |
+| `strategy` | Tactician | 策略笔记 |
+
+### Note生命周期
+
+```python
+# 1. 创建
+note_id = workspace.create_note(
+    note_type="midjourney_prompt",
+    content="cyberpunk city, neon lights, rain...",
+    source="step_1"
+)
+
+# 2. 更新评审状态
+workspace.update_note_review_status(
+    note_id="midjourney_prompt1",
+    status="star",
+    comment="高质量，可直接使用"
+)
+
+# 3. 查询
+workspace.get_notes_by_type("midjourney_prompt")  # 按类型
+workspace.get_notes_by_status("star")             # 按状态
+workspace.get_referenceable_notes()               # 可引用的（排除trash）
+```
+
+### Note自动编号
+
+```python
+# workspace.py 第46-51行
+def create_note(self, note_type, content, source):
+    if note_type not in self._note_counters:
+        self._note_counters[note_type] = 0
+
+    self._note_counters[note_type] += 1
+    note_id = f"{note_type}{self._note_counters[note_type]}"
+    # 例如: midjourney_prompt1, midjourney_prompt2, ...
+```
+
+---
+
+## 代码实现详解
+
+### 完整的用户请求流程
+
+```
+1. 用户输入："帮我生成赛博朋克城市夜景的MJ提示词"
+
+2. ImagePromptCLI.handle_user_input()
+   ↓
+3. Concierge.process_user_input()
+   - conversation.add_user_message()
+   - build_concierge_context()
+   - call_llm(system_prompt=concierge_prompt, ...)
+   - 检查响应是否包含 <call_orchestrator>
+   - conversation.add_concierge_response()
+   - 返回清理后的文本给用户
+
+4. CLI检测到 orchestrator_call
+   ↓
+5. run_orchestrator_async()
+   - 清空旧tactician_analysis（如果任务变化）
+   - 启动后台线程
+
+6. Tactician.analyze_task()  [首次执行]
+   - build_tactician_context()
+   - call_llm(system_prompt=tactician_prompt, ...)
+   - 提取strategy_notes → workspace.tactician_analysis
+
+7. Orchestrator.process_task()  [ReAct循环，最多3轮]
+   - build_orchestrator_context()
+   - call_llm(system_prompt=orchestrator_prompt, ...)
+   - 提取 <execute action="xxx"> 命令
+   - 执行每个命令 → execute()
+
+8. execute(action_type, instruction)
+   - 获取 ACTION_PROMPTS[action_type]
+   - build_action_context()
+   - call_llm(system_prompt, user_prompt)
+   - extract_and_create_notes()
+   - workspace.create_note()
+
+9. 返回结果给用户
+```
+
+### 关键代码片段
+
+#### Concierge的XML标签检测
+
+```python
+# concierge.py 第81-104行
+def _extract_orchestrator_call(self, response: str) -> Optional[str]:
+    # 1. 尝试完整标签对
+    complete_pattern = r'<call_orchestrator>(.*?)</call_orchestrator>'
+    match = re.search(complete_pattern, response, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    # 2. 尝试不完整的标签（只有开始标签）
+    incomplete_pattern = r'<call_orchestrator>(.*?)(?=<\w+|\n\n[^<]|$)'
+    match = re.search(incomplete_pattern, response, re.DOTALL)
+    if match:
+        content = match.group(1).strip()
+        if content and not content.startswith('<'):
+            return content
+    return None
+```
+
+#### Orchestrator的并行命令提取
+
+```python
+# orchestrator.py 第232-279行
+def _extract_execute_commands(self, response: str) -> List[Dict[str, str]]:
+    commands = []
+    patterns = [
+        # 标准格式
+        r'<execute\s+action="([^"]+)"\s+instruction="([^"]+)"\s*/?>',
+        # 无引号格式
+        r'<execute\s+action=([^\s]+)\s+instruction=(.*?)(?=\s*/?>)',
+        # 混合格式
+        r'<execute\s+action="([^"]+)"\s+instruction=(.*?)(?=\s*/?>)',
+    ]
+
+    for i, pattern in enumerate(patterns):
+        matches = list(re.finditer(pattern, response, re.DOTALL))
+        if matches:
+            for match in matches:
+                commands.append({
+                    "action": match.group(1).strip().strip('"'),
+                    "instruction": match.group(2).strip().strip('"')
+                })
+            break
+    return commands
+```
+
+#### execute()函数
+
+```python
+# orchestrator.py 第446-587行
+def execute(action_type: str, instruction: str, workspace, conversation) -> Dict:
+    # 1. 获取Action的Prompt模板
+    system_prompt = ACTION_PROMPTS[action_type]
+
+    # 2. 构建Action上下文
+    step = {"action": action_type, "instruction": instruction}
+    user_prompt = build_action_context(step, workspace, conversation)
+
+    # 3. 特殊处理
+    if action_type == "image_to_prompt":
+        # 图片输入处理
+        output = kimi_provider.call_llm_with_image(...)
+    elif action_type == "websearch":
+        # 启用web搜索
+        output = kimi_provider.call_llm(..., enable_websearch=True)
+    else:
+        # 普通调用
+        output = call_llm(system_prompt, user_prompt, temperature, ...)
+
+    # 4. 提取Notes
+    notes_created = extract_and_create_notes(output, step_id, workspace)
+
+    return {
+        "success": True,
+        "output": output,
+        "notes_created": notes_created
+    }
+```
+
+---
+
+## 如何开发新的Agent
+
+### 步骤1：定义Agent的System Prompt
+
+在`prompts/`目录下创建新的prompt文件：
+
+```python
+# prompts/my_agent_prompt.py
+my_agent_prompt = """
+你是MyAgent，一个负责[具体职责]的Agent。
+
+# 你的能力
+- 你可以执行XXX操作
+- 你可以分析XXX内容
+
+# 输出格式
+当需要执行操作时，使用以下标签：
+<my_action param1="value1" param2="value2">
+这是操作说明
+</my_action>
+
+当任务完成时，使用：
+<my_complete>
+任务已完成，结论：...
+</my_complete>
+"""
+```
+
+### 步骤2：创建Agent类
+
+```python
+# agents/my_agent.py
+from model_base import call_llm
+
+class MyAgent:
+    def __init__(self, workspace, conversation):
+        self.workspace = workspace
+        self.conversation = conversation
+        self.system_prompt = my_agent_prompt
+
+    def process_task(self, task_message: str) -> Dict:
+        # 1. 构建上下文
+        context = build_my_agent_context(task_message, self.workspace)
+
+        # 2. 调用LLM
+        response = call_llm(
+            system_prompt=self.system_prompt,
+            user_prompt=context,
+            temperature=0.3
+        )
+
+        # 3. 解析响应
+        actions = self._extract_actions(response)
+
+        # 4. 执行动作
+        results = []
+        for action in actions:
+            result = self._execute_action(action)
+            results.append(result)
+
+        # 5. 返回结果
+        return {
+            "completed": self._is_completed(response),
+            "actions": actions,
+            "results": results
+        }
+
+    def _extract_actions(self, response: str) -> List[Dict]:
+        # 解析 <my_action> 标签
+        ...
+
+    def _execute_action(self, action: Dict) -> Any:
+        # 执行具体动作
+        ...
+```
+
+### 步骤3：注册到CLI
+
+```python
+# ImagePrompt.py
+from agents.my_agent import MyAgent
+
+class ImagePromptCLI:
+    def __init__(self):
+        # ...
+        self.my_agent = MyAgent(self.workspace, self.conversation)
+```
+
+---
+
+## 如何开发新的Action
+
+### 步骤1：添加Action Prompt
+
+在`prompts/action_prompts.py`中定义：
+
+```python
+ACTION_PROMPTS = {
+    # ... 现有actions
+
+    # 新Action
+    "my_new_action": """
+你是MyNewAction，一个负责[具体职责]的Action。
+
+## 输入
+你会收到一个[任务指令]，需要按照要求执行。
+
+## 输出要求
+请生成[具体内容]，包含：
+1. [要素1]
+2. [要素2]
+3. [要素3]
+
+## 格式
+输出必须包含<result>标签：
+<result>
+这是你的输出内容...
+</result>
+""",
+}
+```
+
+### 步骤2：在notes_extractor.py中添加提取规则
+
+```python
+# core/notes_extractor.py
+def extract_and_create_notes(output: str, step_id: str, workspace, expected_types=None):
+    notes_created = []
+
+    # 新Action的提取规则
+    if expected_types and "my_new_action" in expected_types:
+        result_match = re.search(r'<result>(.*?)</result>', output, re.DOTALL)
+        if result_match:
+            note_id = workspace.create_note(
+                note_type="my_new_action",
+                content=result_match.group(1).strip(),
+                source=step_id
+            )
+            notes_created.append(note_id)
+
+    return notes_created
+```
+
+### 步骤3：在execute()中添加特殊处理（可选）
+
+```python
+# orchestrator.py execute()函数
+if action_type == "my_new_action":
+    # 特殊处理逻辑
+    output = my_special_processing(instruction, workspace)
+    # ...
+```
+
+---
+
+## 架构设计总结
+
+### 核心理念
+
+1. **LLM作为Agent的核心大脑**：每个Agent通过System Prompt定义其行为模式
+2. **结构化输出**：通过XML标签实现Agent与系统、Agent与Agent之间的通信
+3. **上下文注入**：每个请求都携带完整的上下文，包括历史、状态、参考资料
+4. **Notes作为共享知识**：所有Agent通过Notes系统共享中间结果
+5. **ReAct循环**：Orchestrator通过推理-行动循环完成复杂任务
+
+### 设计模式
+
+| 模式 | 应用场景 |
+|------|----------|
+| Prompt-Driven | 所有Agent的System Prompt定义 |
+| Context Injection | build_xxx_context() 构建上下文 |
+| XML Tag Protocol | Agent间通信指令 |
+| ReAct Loop | Orchestrator执行循环 |
+| Shared Knowledge Base | WorkSpace.notes |
+| State Machine | ConversationManager状态管理 |
+
+### 扩展点
+
+1. **新Agent**：创建Agent类 + 定义Prompt + 注册到CLI
+2. **新Action**：添加Prompt + 添加提取规则
+3. **新数据存储**：扩展WorkSpace或ConversationManager
+4. **新通信协议**：定义新的XML标签格式
+
+---
+
+## 参考资料
+
+- [ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629)
+- [Prompt Engineering Guide](https://www.promptingguide.ai/)
+- [Building Effective Agents](https://www.anthropic.com/research/building-effective-agents)
+
